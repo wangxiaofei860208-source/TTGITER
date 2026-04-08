@@ -363,18 +363,17 @@ def chat(sid):
     rows = db.execute("SELECT role, content, tool_calls, tool_result FROM messages WHERE session_id=? ORDER BY timestamp", (sid,)).fetchall()
     db.close()
 
-    # Build message history, converting tool messages to text to avoid SiliconFlow compatibility issues
+    # Build full message history with proper tool calling format
     msgs = [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=WORKSPACE)}]
     for r in rows[-MAX_HISTORY:]:
         if r["tool_calls"]:
-            # Convert tool calls to text description
             tc_data = json.loads(r["tool_calls"])
-            desc = "[调用工具: " + ", ".join(t["function"]["name"] for t in tc_data) + "]"
-            content = (r["content"] or "") + "\n" + desc if r["content"] else desc
-            msgs.append({"role": "assistant", "content": content})
+            msgs.append({"role": "assistant", "content": None, "tool_calls": tc_data})
         elif r["role"] == "tool":
-            # Convert tool result to text
-            msgs.append({"role": "assistant", "content": "[工具结果]: " + (r["content"] or "")[:500]})
+            msg = {"role": "tool", "content": r["content"] or ""}
+            if r["tool_result"]:
+                msg["tool_call_id"] = r["tool_result"]
+            msgs.append(msg)
         elif r["role"] == "assistant" and r["content"]:
             msgs.append({"role": "assistant", "content": r["content"]})
         elif r["role"] == "user":
@@ -391,54 +390,27 @@ def chat(sid):
             payload = {
                 "model": MODEL, "messages": msgs, "max_tokens": 8192,
                 "temperature": 0.6, "tools": TOOLS, "tool_choice": "auto",
-                "stream": not is_continuation
+                "stream": True
             }
-            if is_continuation:
-                payload.pop("tool_choice", None)
-                # Keep tools so model knows it can call them
-                payload["tool_choice"] = "auto"
 
-            if is_continuation:
-                # Non-streaming path for tool continuation rounds (more reliable with SiliconFlow)
-                try:
-                    resp = api_request_with_retry(payload, headers, max_retries=2)
-                    if resp is None:
-                        yield f"data: {json.dumps({'type': 'error', 'content': 'API不可用'}, ensure_ascii=False)}\n\n"
-                        break
-                    r = json.loads(resp.read())
-                    msg = r['choices'][0]['message']
-                    # Stream the content to frontend
-                    if msg.get('content'):
-                        yield f"data: {json.dumps({'type': 'content', 'content': msg['content']}, ensure_ascii=False)}\n\n"
-                    if msg.get('tool_calls'):
-                        tool_calls_buf = {i: tc for i, tc in enumerate(msg['tool_calls'])}
-                        content_buf = msg.get('content', '') or ''
-                    else:
-                        full_response = msg.get('content', '') or ''
-                        break
-                except Exception as e:
-                    yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            try:
+                resp = api_request_with_retry(payload, headers)
+                if resp is None:
+                    yield f"data: {json.dumps({'type': 'error', 'content': 'API暂时不可用'}, ensure_ascii=False)}\n\n"
                     break
-            else:
-                # Streaming path for first round
-                try:
-                    resp = api_request_with_retry(payload, headers)
-                    if resp is None:
-                        yield f"data: {json.dumps({'type': 'error', 'content': 'API暂时不可用'}, ensure_ascii=False)}\n\n"
-                        break
-                except Exception as e:
-                    err_msg = str(e)
-                    if "429" in err_msg:
-                        yield f"data: {json.dumps({'type': 'error', 'content': '⚠️ API请求太频繁，请等待30秒后重试'}, ensure_ascii=False)}\n\n"
-                    else:
-                        yield f"data: {json.dumps({'type': 'error', 'content': err_msg}, ensure_ascii=False)}\n\n"
-                    break
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg:
+                    yield f"data: {json.dumps({'type': 'error', 'content': '⚠️ API请求太频繁，请等待30秒后重试'}, ensure_ascii=False)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'error', 'content': err_msg}, ensure_ascii=False)}\n\n"
+                break
 
             content_buf = ""
             tool_calls_buf = {}
 
-            if not is_continuation and resp:
-                # Parse streaming response (first round only)
+            if resp:
+                # Parse streaming response
                 try:
                     for line in resp:
                         line = line.decode("utf-8").strip()
@@ -470,10 +442,6 @@ def chat(sid):
                 break
 
             tc_list = [tool_calls_buf[i] for i in sorted(tool_calls_buf.keys())]
-            # Ensure tool call IDs are in standard format for SiliconFlow compatibility
-            for idx, tc in enumerate(tc_list):
-                if not tc["id"].startswith("call_"):
-                    tc["id"] = f"call_{idx}{int(time.time())}"
             assistant_msg = {"role": "assistant", "content": None, "tool_calls": tc_list}
             msgs.append(assistant_msg)
 
