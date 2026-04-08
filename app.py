@@ -14,7 +14,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
 # === Config ===
-API_URL = os.environ.get("API_URL", "https://api.siliconflow.cn/v1/chat/completions")
+API_URL = os.environ.get("API_URL", "https://2api.199859.xyz/v1/chat/completions")
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V3")
 WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~"))
