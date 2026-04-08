@@ -381,9 +381,18 @@ def chat(sid):
                 "stream": not is_continuation
             }
             if is_continuation:
-                # Don't send tools for continuation - just get a summary response
+                # Don't send tools - just get a summary response
                 payload.pop("tools", None)
                 payload.pop("tool_choice", None)
+                # Build simple summary request to avoid SiliconFlow tool message issues
+                tool_summary = ""
+                for tc in tc_list:
+                    tool_summary += f"- 执行了 {tc['function']['name']}\n"
+                summary_msgs = [
+                    {"role": "system", "content": "你是助手。简要总结刚才执行的操作。"},
+                    {"role": "user", "content": f"刚才执行了以下操作：\n{tool_summary}\n请用一句话总结结果。"}
+                ]
+                payload["messages"] = summary_msgs
 
             if is_continuation:
                 # Non-streaming path for tool continuation rounds (more reliable with SiliconFlow)
