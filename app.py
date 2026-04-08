@@ -17,7 +17,7 @@ app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 API_URL = os.environ.get("API_URL", "https://api.siliconflow.cn/v1/chat/completions")
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V3")
-WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~/workspace"))
+WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~"))
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "pyclaudecode.db")
@@ -30,28 +30,16 @@ if not API_KEY:
     print("❌ 请设置 DEEPSEEK_API_KEY 环境变量")
     sys.exit(1)
 
-SYSTEM_PROMPT = """你是一个强大的AI编程助手，类似Claude Code。你有以下工具：
+SYSTEM_PROMPT = """你是AI编程助手。用户让你做什么你就做什么，直接行动不要废话。
 
-1. **read_file** - 读取文件内容
-2. **write_file** - 创建/覆盖文件
-3. **edit_file** - 精确编辑文件（类似sed，替换指定内容）
-4. **run_command** - 执行Shell命令
-5. **list_dir** - 列出目录内容
-6. **search** - 在文件中搜索（grep）
-7. **web_fetch** - 获取网页内容
+可用工具：read_file, write_file, edit_file, run_command, list_dir, search, web_fetch
 
-工作原则：
-- 先理解需求，再写代码
-- 修改文件前先读取确认
-- 每次修改后验证结果
-- 使用项目约定的风格
-- 不加注释除非必要
-- 遇到错误先分析原因再修复
-- 完成后简要说明做了什么
+规则：
+- 用户让写文件就用write_file，让执行命令就用run_command
+- 直接做，不要先解释
+- 完成后简要说明
 
-当前工作目录: {workspace}
-操作系统: macOS (arm64)
-"""
+工作目录: {workspace}"""
 
 # === Tools Definition ===
 TOOLS = [
@@ -253,10 +241,13 @@ def api_request_with_retry(payload, headers, max_retries=3):
             resp = urllib.request.urlopen(req, timeout=120)
             return resp
         except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='ignore')[:500] if hasattr(e, 'read') else ''
             if e.code == 429 and attempt < max_retries - 1:
                 wait = (attempt + 1) * 5
                 time.sleep(wait)
                 continue
+            if e.code == 400:
+                raise Exception(f"API 400 Bad Request: {body}")
             raise
     return None
 
@@ -366,18 +357,15 @@ def chat(sid):
     rows = db.execute("SELECT role, content, tool_calls, tool_result FROM messages WHERE session_id=? ORDER BY timestamp", (sid,)).fetchall()
     db.close()
 
+    # Only send the latest user message + system prompt to avoid SiliconFlow tool message compatibility issues
+    last_user_msg = ""
+    for r in reversed(rows):
+        if r["role"] == "user":
+            last_user_msg = r["content"]
+            break
     msgs = [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=WORKSPACE)}]
-    for r in rows[-MAX_HISTORY:]:
-        if r["tool_calls"]:
-            msg = {"role": "assistant", "content": r["content"] or "", "tool_calls": json.loads(r["tool_calls"])}
-            msgs.append(msg)
-        elif r["role"] == "tool":
-            msg = {"role": "tool", "content": r["content"]}
-            if r["tool_result"]:
-                msg["tool_call_id"] = r["tool_result"]
-            msgs.append(msg)
-        else:
-            msgs.append({"role": r["role"], "content": r["content"]})
+    if last_user_msg:
+        msgs.append({"role": "user", "content": last_user_msg})
 
     def generate():
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
@@ -386,59 +374,95 @@ def chat(sid):
 
         while round_num < MAX_TOOL_ROUNDS:
             round_num += 1
+            is_continuation = round_num > 1
             payload = {
                 "model": MODEL, "messages": msgs, "max_tokens": 8192,
-                "temperature": 0.6, "stream": True, "tools": TOOLS, "tool_choice": "auto"
+                "temperature": 0.6, "tools": TOOLS, "tool_choice": "auto",
+                "stream": not is_continuation
             }
+            if is_continuation:
+                # Don't send tools for continuation - just get a summary response
+                payload.pop("tools", None)
+                payload.pop("tool_choice", None)
 
-            try:
-                resp = api_request_with_retry(payload, headers)
-                if resp is None:
-                    yield f"data: {json.dumps({'type': 'error', 'content': 'API暂时不可用，请稍后重试'}, ensure_ascii=False)}\n\n"
+            if is_continuation:
+                # Non-streaming path for tool continuation rounds (more reliable with SiliconFlow)
+                try:
+                    resp = api_request_with_retry(payload, headers, max_retries=2)
+                    if resp is None:
+                        yield f"data: {json.dumps({'type': 'error', 'content': 'API不可用'}, ensure_ascii=False)}\n\n"
+                        break
+                    r = json.loads(resp.read())
+                    msg = r['choices'][0]['message']
+                    # Stream the content to frontend
+                    if msg.get('content'):
+                        yield f"data: {json.dumps({'type': 'content', 'content': msg['content']}, ensure_ascii=False)}\n\n"
+                    if msg.get('tool_calls'):
+                        tool_calls_buf = {i: tc for i, tc in enumerate(msg['tool_calls'])}
+                        content_buf = msg.get('content', '') or ''
+                    else:
+                        full_response = msg.get('content', '') or ''
+                        break
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
                     break
-            except Exception as e:
-                err_msg = str(e)
-                if "429" in err_msg:
-                    yield f"data: {json.dumps({'type': 'error', 'content': '⚠️ API请求太频繁，请等待30秒后重试'}, ensure_ascii=False)}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type': 'error', 'content': err_msg}, ensure_ascii=False)}\n\n"
-                break
+            else:
+                # Streaming path for first round
+                try:
+                    resp = api_request_with_retry(payload, headers)
+                    if resp is None:
+                        yield f"data: {json.dumps({'type': 'error', 'content': 'API暂时不可用'}, ensure_ascii=False)}\n\n"
+                        break
+                except Exception as e:
+                    err_msg = str(e)
+                    if "429" in err_msg:
+                        yield f"data: {json.dumps({'type': 'error', 'content': '⚠️ API请求太频繁，请等待30秒后重试'}, ensure_ascii=False)}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'error', 'content': err_msg}, ensure_ascii=False)}\n\n"
+                    break
 
             content_buf = ""
             tool_calls_buf = {}
 
-            try:
-                for line in resp:
-                    line = line.decode("utf-8").strip()
-                    if not line.startswith("data: ") or line == "data: [DONE]":
-                        continue
-                    chunk = json.loads(line[6:])
-                    delta = chunk["choices"][0].get("delta", {})
-                    if "content" in delta and delta["content"]:
-                        content_buf += delta["content"]
-                        yield f"data: {json.dumps({'type': 'content', 'content': delta['content']}, ensure_ascii=False)}\n\n"
-                    if "tool_calls" in delta:
-                        for tc in delta["tool_calls"]:
-                            idx = tc.get("index", 0)
-                            if idx not in tool_calls_buf:
-                                tool_calls_buf[idx] = {"id": tc.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
-                            if tc.get("id"):
-                                tool_calls_buf[idx]["id"] = tc["id"]
-                            if "function" in tc:
-                                if tc["function"].get("name"):
-                                    tool_calls_buf[idx]["function"]["name"] += tc["function"]["name"]
-                                if tc["function"].get("arguments"):
-                                    tool_calls_buf[idx]["function"]["arguments"] += tc["function"]["arguments"]
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
-                break
+            if not is_continuation and resp:
+                # Parse streaming response (first round only)
+                try:
+                    for line in resp:
+                        line = line.decode("utf-8").strip()
+                        if not line.startswith("data: ") or line == "data: [DONE]":
+                            continue
+                        chunk = json.loads(line[6:])
+                        delta = chunk["choices"][0].get("delta", {})
+                        if "content" in delta and delta["content"]:
+                            content_buf += delta["content"]
+                            yield f"data: {json.dumps({'type': 'content', 'content': delta['content']}, ensure_ascii=False)}\n\n"
+                        if "tool_calls" in delta:
+                            for tc in delta["tool_calls"]:
+                                idx = tc.get("index", 0)
+                                if idx not in tool_calls_buf:
+                                    tool_calls_buf[idx] = {"id": tc.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
+                                if tc.get("id"):
+                                    tool_calls_buf[idx]["id"] = tc["id"]
+                                if "function" in tc:
+                                    if tc["function"].get("name"):
+                                        tool_calls_buf[idx]["function"]["name"] += tc["function"]["name"]
+                                    if tc["function"].get("arguments"):
+                                        tool_calls_buf[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+                    break
 
             if not tool_calls_buf:
                 full_response = content_buf
                 break
 
             tc_list = [tool_calls_buf[i] for i in sorted(tool_calls_buf.keys())]
-            msgs.append({"role": "assistant", "content": content_buf or "", "tool_calls": tc_list})
+            # Ensure tool call IDs are in standard format for SiliconFlow compatibility
+            for idx, tc in enumerate(tc_list):
+                if not tc["id"].startswith("call_"):
+                    tc["id"] = f"call_{idx}{int(time.time())}"
+            assistant_msg = {"role": "assistant", "content": None, "tool_calls": tc_list}
+            msgs.append(assistant_msg)
 
             for tc in tc_list:
                 fn = tc["function"]["name"]
@@ -454,7 +478,7 @@ def chat(sid):
                 db = get_db()
                 now = time.time()
                 db.execute("INSERT INTO messages (session_id,role,content,tool_calls,timestamp) VALUES (?,?,?,?,?)",
-                           (sid, "assistant", json.dumps({"tool": fn, "args": fargs}, ensure_ascii=False), json.dumps(tc_list, ensure_ascii=False), now))
+                           (sid, "assistant", content_buf or None, json.dumps(tc_list, ensure_ascii=False), now))
                 db.execute("INSERT INTO messages (session_id,role,content,tool_result,timestamp) VALUES (?,?,?,?,?)",
                            (sid, "tool", result, tc["id"], now))
                 db.commit()
