@@ -36,7 +36,9 @@ SYSTEM_PROMPT = """你是AI编程助手。用户让你做什么你就做什么�
 
 规则：
 - 用户让写文件就用write_file，让执行命令就用run_command
-- 直接做，不要先解释
+- write_file可以写任何格式的文件，包括.docx/.html/.md/.py等
+- .docx文件直接写Markdown内容即可，Word可以正常打开
+- 直接做，不要先解释，不要问用户选择
 - 完成后简要说明
 
 工作目录: {workspace}"""
@@ -238,7 +240,7 @@ def api_request_with_retry(payload, headers, max_retries=3):
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(API_URL, data=json.dumps(payload).encode(), headers=headers)
-            resp = urllib.request.urlopen(req, timeout=120)
+            resp = urllib.request.urlopen(req, timeout=180)
             return resp
         except urllib.error.HTTPError as e:
             body = e.read().decode('utf-8', errors='ignore')[:500] if hasattr(e, 'read') else ''
@@ -249,7 +251,11 @@ def api_request_with_retry(payload, headers, max_retries=3):
             if e.code == 400:
                 raise Exception(f"API 400 Bad Request: {body}")
             raise
-    return None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+                continue
+            raise
 
 # === Database ===
 def get_db():
@@ -357,15 +363,22 @@ def chat(sid):
     rows = db.execute("SELECT role, content, tool_calls, tool_result FROM messages WHERE session_id=? ORDER BY timestamp", (sid,)).fetchall()
     db.close()
 
-    # Only send the latest user message + system prompt to avoid SiliconFlow tool message compatibility issues
-    last_user_msg = ""
-    for r in reversed(rows):
-        if r["role"] == "user":
-            last_user_msg = r["content"]
-            break
+    # Build message history, converting tool messages to text to avoid SiliconFlow compatibility issues
     msgs = [{"role": "system", "content": SYSTEM_PROMPT.format(workspace=WORKSPACE)}]
-    if last_user_msg:
-        msgs.append({"role": "user", "content": last_user_msg})
+    for r in rows[-MAX_HISTORY:]:
+        if r["tool_calls"]:
+            # Convert tool calls to text description
+            tc_data = json.loads(r["tool_calls"])
+            desc = "[调用工具: " + ", ".join(t["function"]["name"] for t in tc_data) + "]"
+            content = (r["content"] or "") + "\n" + desc if r["content"] else desc
+            msgs.append({"role": "assistant", "content": content})
+        elif r["role"] == "tool":
+            # Convert tool result to text
+            msgs.append({"role": "assistant", "content": "[工具结果]: " + (r["content"] or "")[:500]})
+        elif r["role"] == "assistant" and r["content"]:
+            msgs.append({"role": "assistant", "content": r["content"]})
+        elif r["role"] == "user":
+            msgs.append({"role": "user", "content": r["content"]})
 
     def generate():
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
@@ -381,18 +394,9 @@ def chat(sid):
                 "stream": not is_continuation
             }
             if is_continuation:
-                # Don't send tools - just get a summary response
-                payload.pop("tools", None)
                 payload.pop("tool_choice", None)
-                # Build simple summary request to avoid SiliconFlow tool message issues
-                tool_summary = ""
-                for tc in tc_list:
-                    tool_summary += f"- 执行了 {tc['function']['name']}\n"
-                summary_msgs = [
-                    {"role": "system", "content": "你是助手。简要总结刚才执行的操作。"},
-                    {"role": "user", "content": f"刚才执行了以下操作：\n{tool_summary}\n请用一句话总结结果。"}
-                ]
-                payload["messages"] = summary_msgs
+                # Keep tools so model knows it can call them
+                payload["tool_choice"] = "auto"
 
             if is_continuation:
                 # Non-streaming path for tool continuation rounds (more reliable with SiliconFlow)
