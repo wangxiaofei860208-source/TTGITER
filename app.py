@@ -16,7 +16,7 @@ app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 # === Config ===
 API_URL = os.environ.get("API_URL", "https://2api.199859.xyz/v1/chat/completions")
 API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V3")
+MODEL = os.environ.get("MODEL", "deepseek-ai/DeepSeek-V3.2")
 WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~"))
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 HERE = os.path.dirname(os.path.abspath(__file__))
